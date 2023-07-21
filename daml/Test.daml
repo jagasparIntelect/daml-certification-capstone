@@ -1,0 +1,148 @@
+{-# LANGUAGE ApplicativeDo #-}
+module Test where
+
+import Daml.Script
+import DA.Optional (fromSomeNote)
+import Main
+import Setup
+
+{-
+    Min 1 Full Scenario & Min 3 Happy Paths
+        + testTicketPurchase: tests the full path
+            1. eventOwner creates the events as part of the initialSetup and adds the existing clients as observers to the contracts
+            2. clients create TicketPurchaseProposal contracts
+            3. One of the clients changes one of its TicketPurchaseProposal to match another event
+            3. eventOwner rejects one the the proposals and accepts the other two
+            4. clientB party makes another TicketPurchaseProposal with the correct pricing
+            5. eventOwner accepts the correct TicketPurchaseProposal
+            6. eventOwner exercises the EventHappened choice after the event occured
+
+    Min 3 Unhappy Paths
+        - cantCreateTicketForUnexistentEvent: eventOwner cannot accept a purchase proposal if the eventId doesn't exist in any Event contract
+        - cantCreateTicketForSoldOutEvent: eventOwner cannot accept a purchase proposal if for that event ticketsAvailable = 0
+        - cantCreateTicketIfAlreadyHasOne: eventOwner cannot accept a purchase proposal if there's already a Ticket contract with that party and eventId in the contract key
+        - cantAddObserversIfAlreadyThere: eventOwner cannot add observers to the event contract if the observers list already contains any of the new parties
+-}
+
+testTicketPurchase = script do
+    (TestParties{..}, _) <- initialSetup
+    
+    -- Ticket purchase proposals contracts are created by the client parties
+    proposalA1Cid <- submit clientA do
+        createCmd TicketPurchaseProposal with
+            proposer = clientA
+            seller = eventOwner
+            ticketInfo = TicketInfo with
+                ticketType = Individual 1
+                price = 50.0
+
+    proposalB1Cid <- submit clientB do
+        createCmd TicketPurchaseProposal with
+            proposer = clientB
+            seller = eventOwner
+            ticketInfo = TicketInfo with
+                ticketType = Individual 1
+                price = 45.0
+    
+    proposalB3Cid <- submit clientB do
+        createCmd TicketPurchaseProposal with
+            proposer = clientB
+            seller = eventOwner
+            ticketInfo = TicketInfo with
+                ticketType = Individual 3
+                price = 50.0
+    
+    -- One of the client parties decides to change one of its ticket purchase proposals to match another event
+    proposalB2Cid <- submit clientB do
+        exerciseCmd proposalB3Cid ChangeProposal with
+            newTicketInfo = TicketInfo with
+                ticketType = Individual 2
+                price = 50.0
+
+    -- eventOwner party decides to reject one of the proposals and accepts the other two leading to the creation of two Ticket contracts
+    (ticketA1Cid, ticketB2Cid) <- submit eventOwner do
+        exerciseCmd proposalB1Cid RejectPurchase with reason = "Price to low"
+        ticketA1Cid <- exerciseCmd proposalA1Cid AcceptPurchase
+        ticketB2Cid <- exerciseCmd proposalB2Cid AcceptPurchase
+        return (ticketA1Cid, ticketB2Cid)
+    
+    -- clientB party sees the reason its proposal got rejected and does another one with a changed price value, eventOwner accepts it this time
+    proposalB1Cid <- submit clientB do
+        createCmd TicketPurchaseProposal with
+            proposer = clientB
+            seller = eventOwner
+            ticketInfo = TicketInfo with
+                ticketType = Individual 1
+                price = 50.0
+    
+    submit eventOwner do
+        exerciseCmd proposalB1Cid AcceptPurchase
+    
+    -- Event with eventId = 1 happened, tickets were used so the contracts got archived as well as the event contracts
+    ticketCids <- queryFilter @Ticket eventOwner (\ticket -> getEventId ticket.ticketInfo == 1) >>= (return . map fst)
+    (event1Cid, _) <- queryContractKey @Event eventOwner (eventOwner, 1) >>= (return . fromSomeNote "Event does not exist")
+    submit eventOwner do
+        exerciseCmd event1Cid EventHappened with
+            ticketCids
+
+-- eventOwner cannot accept purchase proposals for events that doesn't exist
+cantCreateTicketForUnexistentEvent = script do
+    (TestParties{..}, _) <- initialSetup
+
+    proposalA1Cid <- submit clientA do
+        createCmd TicketPurchaseProposal with
+            proposer = clientA
+            seller = eventOwner
+            ticketInfo = TicketInfo with
+                ticketType = Individual 4
+                price = 50.0
+    
+    submitMustFail eventOwner do
+        exerciseCmd proposalA1Cid AcceptPurchase
+
+-- eventOwner cannot accept purchase proposals for sold out events
+cantCreateTicketForSoldOutEvent = script do
+    (TestParties{..}, [event1Cid, _, _]) <- initialSetup
+    
+    event <- queryContractId eventOwner event1Cid >>= (return . fromSomeNote "Event does not exist")
+    event1Cid <- submit eventOwner do
+        exerciseCmd event1Cid ChangeAvailableTickets with newTicketsAvailable = event.eventTicketInfo.ticketsAvailable - event.eventTicketInfo.ticketsAvailable
+
+    proposalA1Cid <- submit clientA do
+        createCmd TicketPurchaseProposal with
+            proposer = clientA
+            seller = eventOwner
+            ticketInfo = TicketInfo with
+                ticketType = Individual 1
+                price = 50.0
+
+    submitMustFail eventOwner do
+        exerciseCmd proposalA1Cid AcceptPurchase
+
+--eventOwner cannot accept purchase proposals if the client already has a ticket for that event
+cantCreateTicketIfAlreadyHasOne = script do
+    (TestParties{..}, _) <- initialSetup
+
+    let proposal = TicketPurchaseProposal with
+                    proposer = clientA
+                    seller = eventOwner
+                    ticketInfo = TicketInfo with
+                        ticketType = Individual 1
+                        price = 50.0
+    
+    proposalA1Cid <- submit clientA do createCmd proposal
+
+    submit eventOwner do
+        exerciseCmd proposalA1Cid AcceptPurchase
+
+    proposalA1Cid <- submit clientA do createCmd proposal
+
+    submitMustFail eventOwner do
+        exerciseCmd proposalA1Cid AcceptPurchase
+
+--eventOwner cannot add observers to events if those party are already part of the observers list
+cantAddObserversIfAlreadyThere = script do
+    (TestParties{..}, [event1Cid, _, _]) <- initialSetup
+    
+    submitMustFail eventOwner do
+        exerciseCmd event1Cid AddObservers with newObservers = [clientA]

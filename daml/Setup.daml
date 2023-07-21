@@ -1,0 +1,75 @@
+module Setup where
+
+import Daml.Script
+import Main
+
+data TestParties = TestParties with
+    eventOwner : Party
+    clientA : Party
+    clientB : Party
+
+data InitialEvents = InitialEvents with
+    firstEvent : Event
+    secondEvent : Event
+    thirdEvent : Event
+
+setupTestParties = script do
+    -- Allocate parties
+    eventOwner <- allocatePartyWithHint "NBA" (PartyIdHint "NBA")
+    clientA <- allocatePartyWithHint "ClientA" (PartyIdHint "ClientA")
+    clientB <- allocatePartyWithHint "ClientB" (PartyIdHint "ClientB")
+    
+    return TestParties with
+        eventOwner
+        clientA
+        clientB
+
+setupUsers testParties = script do
+    -- Create users with the given rights 
+    let TestParties{..} = testParties
+
+    adminId <- validateUserId "Admin"
+    aliceId <- validateUserId "Alice"
+    bobId <- validateUserId "Bob"
+
+    createUser (User adminId (Some eventOwner)) [CanActAs eventOwner]
+    createUser (User aliceId (Some clientA)) [CanActAs clientA]
+    createUser (User bobId (Some clientB)) [CanActAs clientB]
+
+
+setupInitialEvents testParties = script do
+    -- Create event datatypes so that they can be created as contracts more easily
+    now <- getTime
+    let
+        TestParties{..} = testParties
+        firstEvent = Event with
+                        owner = eventOwner
+                        eventInfo = EventInfo with
+                            eventId = 1
+                            name = "Lakers x Celtics"
+                            date = now
+                        eventTicketInfo = EventTicketInfo with
+                            price = 50.0
+                            ticketsAvailable = 10000
+                        observers = []
+        secondEvent = firstEvent with
+                        eventInfo.eventId = 2
+                        eventInfo.name = "Nuggets x Heat"
+        thirdEvent = firstEvent with
+                        eventInfo.eventId = 3
+                        eventInfo.name = "Warriors x Nets"
+    
+    return InitialEvents with firstEvent, secondEvent, thirdEvent
+
+initialSetup = script do
+    -- Initial setup for the system and tests with parties allocated, users created and 3 event contracts generated
+    testParties@TestParties{..} <- setupTestParties
+    setupUsers testParties
+    InitialEvents{..} <- setupInitialEvents testParties
+
+    eventCids <- mapA (\event -> submit eventOwner do
+                                    createAndExerciseCmd
+                                        event AddObservers {newObservers = [clientA, clientB]}
+            ) [firstEvent, secondEvent, thirdEvent]
+    
+    return (testParties, eventCids)

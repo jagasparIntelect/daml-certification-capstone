@@ -1,0 +1,143 @@
+module Main where
+
+import DA.Action (when, void)
+import DA.Optional (isNone, fromSomeNote)
+import DA.List (dedup)
+import DA.Foldable (forA_)
+
+-- Individual tickets contain the eventId for a specific event, Season tickets can be used for all events
+data TicketType = Individual Int | Season
+ deriving (Eq, Show, Ord)
+
+data TicketInfo = TicketInfo with
+    ticketType : TicketType
+    price : Decimal
+ deriving (Eq, Show, Ord)
+
+class Events i o where
+    getEventId : i -> o
+
+instance Events TicketInfo Int where
+    -- returns the id of an Individual ticket or 0 if it's a Season ticket
+    getEventId ticketInfo = case ticketInfo.ticketType of
+        Individual id -> id
+        Season -> 0
+
+template TicketPurchaseProposal
+    with
+        proposer : Party
+        seller : Party
+        ticketInfo : TicketInfo
+    where
+        signatory proposer
+        observer seller
+
+        -- changes the existent proposal with a new ticketInfo, e.g if the client decides he wants a ticket for a different event
+        nonconsuming choice ChangeProposal : ContractId TicketPurchaseProposal
+            with
+                newTicketInfo : TicketInfo
+            controller proposer
+            do
+                archive self
+                create this with ticketInfo = newTicketInfo
+
+        -- seller can accept the purchase and create a Ticket contract
+        choice AcceptPurchase : ContractId Ticket
+            controller seller 
+            do
+                when (ticketInfo.ticketType /= Season) do
+                    optionalEvent <- lookupByKey @Event (seller, getEventId ticketInfo)
+                    let eventCid = fromSomeNote "The selected event does not exist" optionalEvent
+                    event <- fetch eventCid
+                    assertMsg "The selected event does not have available tickets" $ event.eventTicketInfo.ticketsAvailable > 0
+                    void $ exercise eventCid ChangeAvailableTickets with newTicketsAvailable = decreaseAvailableTickets event.eventTicketInfo
+
+                optionalTicket <- lookupByKey @Ticket (proposer, ticketInfo.ticketType)
+                assertMsg "You already have an individual or season ticket for this event" $ isNone optionalTicket
+
+                emissionDate <- getTime
+                create Ticket with
+                    holder = proposer
+                    seller
+                    ticketInfo
+                    emissionDate
+        
+        -- seller can reject the purchase with a reason note
+        choice RejectPurchase : Text
+            with
+                reason : Text
+            controller seller
+            do return reason
+
+template Ticket
+    with
+        holder : Party
+        seller : Party
+        ticketInfo : TicketInfo
+        emissionDate : Time
+    where
+        signatory holder, seller
+        key (holder, ticketInfo.ticketType) : (Party, TicketType)
+        maintainer key._1
+
+        -- seller can exercise upon the event has happened and archive the Ticket contract
+        choice UsedTicket : ()
+            controller seller
+            do return ()
+
+data EventInfo = EventInfo with
+    eventId : Int
+    name : Text
+    date : Time
+ deriving (Eq, Show, Ord)
+
+data EventTicketInfo = EventTicketInfo with
+    price : Decimal
+    ticketsAvailable : Int
+ deriving (Eq, Show, Ord) 
+
+template Event
+    with
+        owner : Party
+        eventInfo : EventInfo
+        eventTicketInfo : EventTicketInfo
+        observers : [Party]
+    where
+        signatory owner
+        observer observers
+        key (owner, eventInfo.eventId) : (Party, Int)
+        maintainer key._1
+
+        -- ensures that the eventId is always bigger than 0 (tickets with eventId = 0 are season tickets)
+        -- ensures that the number of tickets available are not negative
+        -- ensures that the price is not negative
+        ensure (eventInfo.eventId > 0 && eventTicketInfo.ticketsAvailable >= 0 && eventTicketInfo.price >= 0.0)
+
+        -- owner can add clients as observers to the event contract so that they can see it and decide to purchase a ticket for it
+        choice AddObservers : ContractId Event
+            with
+                newObservers : [Party]
+            controller owner
+            do
+                forA_ newObservers (\newObserver -> assertMsg ("Party " <> show newObserver <> " already is an observer") $ newObserver `notElem` observers)
+                create this with
+                    observers = dedup $ observers ++ newObservers
+        
+        -- owner can change the amount of available tickets for the Event. If it reaches 0, no more Tickets can be purchased
+        choice ChangeAvailableTickets : ContractId Event
+            with
+                newTicketsAvailable : Int
+            controller owner
+            do
+                create this with eventTicketInfo.ticketsAvailable = newTicketsAvailable
+        
+        -- owner can exercise upon the event has happened and archive the event contract and all the Ticket contracts purchased for the event
+        choice EventHappened : ()
+            with
+                ticketCids : [ContractId Ticket]
+            controller owner
+            do
+                forA_ ticketCids (`exercise` UsedTicket)
+
+decreaseAvailableTickets : EventTicketInfo -> Int
+decreaseAvailableTickets eventTicketInfo = eventTicketInfo.ticketsAvailable - 1
